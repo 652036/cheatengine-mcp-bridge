@@ -1,114 +1,90 @@
-[Demo](https://github.com/user-attachments/assets/a184a006-f569-4b55-858a-ed80a7139035)
+# Cheat Engine MCP Bridge (Hardened Edition)
 
-# Cheat Engine MCP Bridge
+[![Version](https://img.shields.io/badge/bridge-v11.6.3--hardened-blue.svg)](#)
+[![Platform](https://img.shields.io/badge/platform-Windows-0078D6.svg)](#)
+[![Python](https://img.shields.io/badge/python-3.10%2B-green.svg)](https://python.org)
+[![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
 
-**Let multibillion $ AI datacenters analyze the program memory for you.**
-
-Create mods, trainers, security audits, game bots, accelerate RE, or do anything else with any program and game in a fraction of a time.
-
-[![Version](https://img.shields.io/badge/version-11.6.3-blue.svg)](#) [![Python](https://img.shields.io/badge/python-3.10%2B-green.svg)](https://python.org)
+A hardened, high-throughput **Model Context Protocol (MCP)** server and Cheat Engine Lua bridge for Windows reverse engineering, memory inspection, disassembly, bounded hardware breakpoint sampling, and optional DBVM hypervisor tracing.
 
 > [!NOTE]
-> Enhanced standalone edition derived from [miscusi-peek/cheatengine-mcp-bridge](https://github.com/miscusi-peek/cheatengine-mcp-bridge) (MIT License). Major additions include threaded FastMCP pipe isolation, automatic idle pipe release & CE watchdog, unified request deadlines without replaying ambiguous writes, hot-reloadable Lua dispatcher, bounded conditional hardware breakpoints, 18s x64 region-cache optimization, hardened AOB/DBVM/stack capture paths, standalone `check_pipe.py` diagnostics, and offline Lua/Python regression suites.
+> Standalone hardened edition derived from [miscusi-peek/cheatengine-mcp-bridge](https://github.com/miscusi-peek/cheatengine-mcp-bridge) (MIT License).
 
 ---
 
-## The Problem
+## Key Improvements in This Edition
 
-You're staring at gigabytes of memory. Millions of addresses. Thousands of functions. Finding *that one pointer*, *that one structure* takes **days or weeks** of manual work.
-
-**What if you could just ask?**
-
-> *"Find the packet decryptor hook."*  
-> *"Find the OPcode of character coordinates."*  
-> *"Find the OPcode of health values."*  
-> *"Find the unique AOB pattern to make my trainer reliable after game updates."*
-
-**That's exactly what this does.**
-
-_- Stop clicking through hex dumps and start having conversations with the memory._
+- **Non-blocking MCP event loop & safe Win32 overlapped I/O**: Every tool runs blocking named-pipe I/O off FastMCP's event loop, reuses a single Win32 event handle, shares one monotonic request deadline across queue/connect/read/write/retries, cancels and drains pending overlapped I/O before releasing buffers, and never replays ambiguous side-effecting writes.
+- **No multi-session pipe lockouts**: Cheat Engine serves one pipe client at a time. The Python client automatically releases idle pipe handles (`CE_MCP_IDLE_DISCONNECT_MS`, default 3 s) and transparently reconnects with a `CreateFile`-first retry loop; the Lua bridge enforces a 60 s idle watchdog as a server-side safety net.
+- **Shared-host authentication (`CE_MCP_AUTH_TOKEN`)**: Optional constant-time shared-secret token verification across the Lua dispatcher, `mcp_cheatengine.py`, and `check_pipe.py` to guard against untrusted local accounts on shared Windows hosts.
+- **Hot-reloadable Lua dispatcher**: Re-executing `ce_mcp_bridge.lua` updates handlers in place without stopping an active pipe worker or deadlocking Cheat Engine.
+- **Safe bounded hardware breakpoints**: Refuses implicit debugger auto-start from synchronous pipe dispatch, verifies native install/remove state against CE's breakpoint list, defaults to `one_shot=True` + `max_triggers=256`, supports register/memory pre-capture conditions, and captures stack frames via single bulk reads while preserving `[RSP + i*ptrSize]` offsets.
+- **Large x64 process performance**: Eliminates multi-second `enumMemoryRegions()` sort/cache stalls, adds precomputed `HEX_BYTE` lookup tables, anchor-relative AOB scanning, multi-window scanning (`max_windows` up to 64), O(N) DBVM ring compaction, and cached disassembly on `stop_dbvm_watch`.
+- **Standalone diagnostics & 298 offline checks**: Includes `check_pipe.py` (zero `mcp` dependency) plus offline Lua 5.3/5.4 (245 checks) and Python/isolated-pipe (53 tests, 35 subtests) regression suites.
 
 ---
 
-## What You Get:
+## Architecture
 
-| Before (Manual) | After (AI Agent + MCP) |
-|-----------------|---------------------|
-| Day 1: Find packet address | Minute 1: "Find RX packet decryption hook" |
-| Day 2: Trace what writes to it | Minute 3: "Generate unique AOB signature to make it update persistent" |
-| Day 3: Find RX hook | Minute 6: "Find movement OPcodes" |
-| Day 4: Document structure | Minute 10: "Create python interpreter of hex to plain text" |
-| Day 5: Game updates, start over | **Done.** |
-
-**Your AI can now:**
-- Read any memory instantly (integers, floats, strings, pointers)
-- Follow pointer chains: `[[base+0x10]+0x20]+0x8` → resolved in ms
-- Auto-analyze structures with field types and values
-- Identify C++ objects via RTTI: *"This is a CPlayer object"*
-- Disassemble and analyze functions
-- Collect bounded hardware-breakpoint samples, with optional Ring -1 watches
-- And much more!
-
----
-
-## How It Works
 ```mermaid
-flowchart TD
-    AI[AI Agent: Claude/Cursor/Copilot]
-    
-    AI -->|MCP Protocol - JSON-RPC over stdio| MCP
-    
-    MCP[mcp_cheatengine.py - Python MCP Server]
-    
-    MCP <-->|Named Pipe - Async| PIPE
-    
-    PIPE["\\.\\pipe\\CE_MCP_Bridge_v99"]
-    
-    PIPE <--> CE
-    
-    subgraph CE[Cheat Engine - user mode; DBVM optional]
-        subgraph LUA[ce_mcp_bridge.lua]
-            WORKER[Worker Thread - Blocking I/O]
-            MAIN[Main Thread - GUI + CE API]
-            WORKER <-->|Sync| MAIN
-        end
-    end
-    
-    MAIN -->|Memory Access| TARGET[Target .exe]
+flowchart LR
+    AI["AI Client (Claude / Codex / Cursor / IDE)"]
+    MCP["mcp_cheatengine.py\nFastMCP + Worker Threads"]
+    PIPE["\\\\.\\pipe\\CE_MCP_Bridge_v99\nLength-Prefixed JSON-RPC 2.0"]
+    WORKER["ce_mcp_bridge.lua\nPipeWorker Thread"]
+    MAIN["Cheat Engine Main Thread\nHot-Reloadable Dispatcher"]
+    TARGET["Attached Target Process"]
+
+    AI <-->|"MCP over stdio (LF)"| MCP
+    MCP <-->|"Win32 Overlapped I/O"| PIPE
+    PIPE <-->|"Blocking Pipe I/O"| WORKER
+    WORKER <-->|"thread.synchronize"| MAIN
+    MAIN <-->|"Read / Write / Debug / DBVM"| TARGET
 ```
+
 ---
 
-## Installation
+## Requirements & Installation
+
+- **OS**: Windows (uses Win32 Named Pipes via `pywin32`)
+- **Python**: 3.10+
+- **Cheat Engine**: 7.5+ / 7.6 (64-bit recommended)
+
+Install dependencies:
 
 ```bash
 pip install -r MCP_Server/requirements.txt
 ```
+
 Or manually:
+
 ```bash
 pip install "mcp>=1.2.0,<2.0" pywin32
 ```
 
-> [!NOTE]
-> **Windows only** - Uses Named Pipes (`pywin32`)
+> [!IMPORTANT]
+> Keep `mcp` pinned to `>=1.2.0,<2.0`. Versions `1.0.x`–`1.1.x` lack `FastMCP` / `mcp.shared.message`, and `2.x` removed `FastMCP`.
 
 ---
 
 ## Quick Start
 
-### 1. Load Bridge in Cheat Engine
-```
-1. File → Execute Script → Open ce_mcp_bridge.lua → Execute.
-2. Enable DBVM only if you explicitly need the `*_dbvm_watch` tools.
-```
-Look for: `[MCP v11.6.3] MCP Server Listening on: CE_MCP_Bridge_v99`
+### 1. Start the Bridge in Cheat Engine
 
-The worker resolves a global command dispatcher for each request. Re-running the
-script hot-swaps handlers without stopping the connected pipe worker. A pre-11.6.2
-legacy worker cannot hot-swap safely; restart CE once, load v11.6.3, and later script
-updates will apply in place.
+1. Open Cheat Engine and attach to your target process.
+2. Open **File → Execute Script** (or **Table → Show Cheat Table Lua Script**), load `MCP_Server/ce_mcp_bridge.lua`, and execute it.
+3. Confirm the Lua console prints:
 
-### 2. Configure MCP Client
-Add to your MCP configuration (e.g., `mcp_config.json`):
+```text
+[MCP v11.6.3] MCP Server Listening on: CE_MCP_Bridge_v99
+```
+
+Re-running `ce_mcp_bridge.lua` hot-swaps command handlers in place while preserving the running pipe worker.
+
+### 2. Configure Your MCP Client
+
+Add an entry to your IDE / agent MCP config (e.g. `mcp_config.json`):
+
 ```json
 {
   "servers": {
@@ -119,308 +95,138 @@ Add to your MCP configuration (e.g., `mcp_config.json`):
   }
 }
 ```
-Restart the IDE to load the MCP server config.
 
-### Optional Environment Overrides
-If you run multiple bridge instances or need longer startup windows, the Python side now honors these environment variables:
+Restart your IDE or MCP host, then call `ping` or `status` to verify connectivity.
 
-```powershell
-$env:CE_MCP_PIPE_NAME="CE_MCP_Bridge_v99"
-$env:CE_MCP_SERVER_NAME="cheatengine"
-$env:CE_MCP_TIMEOUT_MS="120000"
-$env:CE_MCP_CONNECT_WAIT_MS="3000"
-$env:CE_MCP_CONNECT_RETRIES="3"
-$env:CE_MCP_CONNECT_RETRY_DELAY_MS="250"
-```
+### 3. Verify Directly with `check_pipe.py`
 
-- `CE_MCP_PIPE_NAME`: short pipe name or full `\\.\pipe\...` path
-- `CE_MCP_SERVER_NAME`: override the FastMCP server name exposed to your IDE
-- `CE_MCP_TIMEOUT_MS`: default total pipe request budget, shared by the queue, connection, I/O and safe retries (default 120000 ms). An explicit tool timeout overrides this budget.
-- `CE_MCP_CONNECT_WAIT_MS` × `CE_MCP_CONNECT_RETRIES`: cap on each connection attempt (default 9 s), limited by the remaining request budget
-- `CE_MCP_CONNECT_RETRY_DELAY_MS`: delay between connection retries for unexpected errors
-- `CE_MCP_PIPE_MISSING_GRACE_MS`: how long to wait when the pipe does not exist at all (default 1000 ms, so a missing CE fails fast)
-- `CE_MCP_IDLE_DISCONNECT_MS`: release the pipe after this much inactivity (default 3000 ms; `0` = after every command, negative = never)
-- `CE_MCP_MAX_RESPONSE_BYTES`: hard cap on a single CE response (default 64 MB)
-- `CE_MCP_MAX_LOCAL_FILE_BYTES`: hard cap on local files loaded by `evaluate_lua_file`, `auto_assemble_file`, and `check_pipe.py --lua-file` (default 16 MB, minimum 1 MB)
-- `CE_MCP_AUTH_TOKEN`: optional shared-secret token sent on every pipe request (for shared Windows hosts; see **Security & Local Pipe Trust Boundary** below)
-
-#### Security & Local Pipe Trust Boundary
-Cheat Engine's built-in `createPipe()` creates a local Windows Named Pipe without a custom user ACL, so on a multi-user or shared Windows host another local account could connect to the pipe and execute Lua inside Cheat Engine. To protect shared hosts, set a shared secret on **both** sides before executing the bridge script:
-
-In Cheat Engine's Lua console:
-```lua
-CE_MCP_AUTH_TOKEN = "replace-with-a-random-secret"
-```
-
-And in your MCP server environment (and when running `check_pipe.py --auth-token ...` or setting `CE_MCP_AUTH_TOKEN`):
-```powershell
-$env:CE_MCP_AUTH_TOKEN="replace-with-a-random-secret"
-```
-
-When configured, `ce_mcp_bridge.lua` rejects requests missing a matching `auth_token` with JSON-RPC error `-32001` (`Unauthorized`), and `status` reports `auth_required: true` without exposing the token. `check_pipe.py` shares the same local pipe trust boundary and honors `CE_MCP_AUTH_TOKEN` / `--auth-token`.
-
-#### One client at a time
-The CE bridge serves a single pipe client. Every AI session (Claude Code, Codex,
-Cursor…) starts its own `mcp_cheatengine.py`, so an idle session that kept its handle
-open used to lock all the others out ("all pipe instances are busy"). Two layers now
-prevent that without anyone calling `disconnect`:
-
-1. The Python client drops its handle after `CE_MCP_IDLE_DISCONNECT_MS` of inactivity
-   and reconnects transparently on the next tool call.
-2. The Lua bridge disconnects any client that has sent nothing for 60 s — a safety
-   net for old clients or stuck processes. Change it with `CE_MCP_IDLE_KICK_MS = 120000`
-   (or `0` to disable) in CE's Lua console before executing the script.
-
-To pair a second CE instance with its own pipe, set the name on **both** sides — in
-CE's Lua console before executing the bridge script:
-
-```lua
-CE_MCP_PIPE_NAME = "CE_MCP_Bridge_alt"
-```
-
-and on the MCP server with `--pipe CE_MCP_Bridge_alt` or `CE_MCP_PIPE_NAME`.
-
-### 3. Verify Connection
-Use the `ping` tool to verify connectivity:
-```json
-{"success": true, "version": "11.6.3", "message": "CE MCP Bridge v11.6.3 alive"}
-```
-
-For a fuller picture — attached process, architecture, DBK/DBVM availability, live
-breakpoints, DBVM watches — use the `status` tool. It is the right first call when
-something misbehaves.
-
-### 4. Start Asking Questions
-```
-"What process is attached?"
-"Read 16 bytes at the base address"
-"Disassemble the entry point"
-"Run my local Lua helper with evaluate_lua_file"
-"Apply my local AutoAssembler patch with auto_assemble_file"
-```
-
-### 5. Run Local Files Through MCP
-You can now execute local script files directly from the Python MCP layer without copy-pasting them into chat:
-
-```text
-evaluate_lua_file(file_path="C:/path/to/helper.lua", structured=true)
-auto_assemble_file(file_path="C:/path/to/patch.cea")
-```
-
-- `evaluate_lua_file` auto-detects common encodings including UTF-8 and GB-family encodings
-- `auto_assemble_file` is useful for local `.CEA` / AutoAssembler payloads
-- Both tools return `source_file`, `source_encoding`, and `source_length` metadata for traceability
-
-For low-level pipe troubleshooting outside the IDE, `check_pipe.py` talks to CE
-directly — no MCP SDK, no AI client — which separates a broken bridge from a broken
-MCP setup. It uses overlapped pipe I/O, honors `CE_MCP_PIPE_NAME` (overridden by
-`--pipe`) and `CE_MCP_MAX_LOCAL_FILE_BYTES`, accepts `--timeout-ms` (default
-15000 ms, minimum 1000 ms), and prints a checklist instead of a bare OS error on a
-connection failure.
+`check_pipe.py` speaks directly to the named pipe using only `pywin32` (no `mcp` SDK), making it easy to separate CE bridge issues from MCP client configuration issues:
 
 ```bash
 python MCP_Server/check_pipe.py --summary
-```
-
-```bash
 python MCP_Server/check_pipe.py --ping --repeat 5 --timeout-ms 30000
-```
-
-```bash
 python MCP_Server/check_pipe.py --lua-file "C:/path/to/helper.lua"
+python MCP_Server/check_pipe.py --call read_integer --params "{\"address\":\"game.exe+1000\"}"
 ```
 
 ---
 
-## 48 MCP Tools Available
+## Configuration & Security
 
-### Memory
-| Tool | Description |
-|------|-------------|
-| `read_memory`, `read_integer`, `read_string` | Read any data type |
-| `read_pointer_chain` | Follow `[[base+0x10]+0x20]` paths |
-| `scan_all`, `aob_scan` | Find values and byte patterns |
-| `get_memory_regions`, `enum_memory_regions_full` | Enumerate memory regions (pass `refresh=True` after target allocations change) |
+### Environment Variables (`mcp_cheatengine.py` / `check_pipe.py`)
 
-### Analysis
-| Tool | Description |
-|------|-------------|
-| `disassemble`, `analyze_function` | Code analysis |
-| `dissect_structure` | Auto-detect fields and types |
-| `get_rtti_classname` | Identify C++ object types |
-| `find_references`, `find_call_references` | Cross-references |
+| Variable | Default | Description |
+|---|---|---|
+| `CE_MCP_PIPE_NAME` | `CE_MCP_Bridge_v99` | Short pipe name or full `\\.\pipe\...` path (also via `--pipe`) |
+| `CE_MCP_SERVER_NAME` | `cheatengine` | FastMCP server name exposed to the MCP host |
+| `CE_MCP_AUTH_TOKEN` | *(unset)* | Optional shared-secret token attached to every pipe request |
+| `CE_MCP_TIMEOUT_MS` | `120000` | Total monotonic budget (ms) shared by queue, connect, I/O, and safe retries |
+| `CE_MCP_BREAKPOINT_TIMEOUT_MS` | `10000` | Total request budget (ms) for breakpoint install calls (never retried) |
+| `CE_MCP_LOCK_TIMEOUT_MS` | `15000` | Max time (ms) a concurrent request waits for the serialized pipe lock |
+| `CE_MCP_CONNECT_WAIT_MS` | `3000` | Base wait per connect attempt (multiplied by `CE_MCP_CONNECT_RETRIES`, default `3`) |
+| `CE_MCP_CONNECT_RETRY_DELAY_MS` | `250` | Delay (ms) between retries on unexpected connection errors |
+| `CE_MCP_PIPE_MISSING_GRACE_MS` | `1000` | Grace window (ms) to ride out CE's ~50 ms pipe recreation gap |
+| `CE_MCP_IDLE_DISCONNECT_MS` | `3000` | Idle time (ms) before releasing the pipe handle (`0` = every call, `< 0` = never) |
+| `CE_MCP_MAX_RESPONSE_BYTES` | `67108864` (64 MB) | Hard limit on a single CE response frame |
+| `CE_MCP_MAX_LOCAL_FILE_BYTES` | `16777216` (16 MB) | Hard limit for `evaluate_lua_file`, `auto_assemble_file`, and `check_pipe.py --lua-file` (min 1 MB) |
+| `CE_MCP_MAX_SCAN_BUDGET` | `200000` | Max address budget per scan window |
 
-### Debugging
-| Tool | Description |
-|------|-------------|
-| `set_breakpoint`, `set_data_breakpoint` | Hardware breakpoints |
-| `start_dbvm_watch`, `poll_dbvm_watch`, `stop_dbvm_watch` | Ring -1 invisible tracing |
+### Lua-Side Overrides (Set in CE Console Before Executing Script)
 
-### Bridge control
-| Tool | Description |
-|------|-------------|
-| `status` | Attached process, DBK/DBVM state, live breakpoints and watches |
-| `cleanup` | Drop all breakpoints, watches and scan objects without reloading the script |
-| `auto_assemble` | Run a script's `[ENABLE]` section, then revert it with `disable=True` |
+```lua
+CE_MCP_PIPE_NAME = "CE_MCP_Bridge_alt"       -- pair with --pipe CE_MCP_Bridge_alt
+CE_MCP_IDLE_KICK_MS = 60000                  -- kick silent client after 60s (0 disables)
+CE_MCP_AUTH_TOKEN = "replace-with-a-secret"  -- require matching auth_token on every request
+```
 
-And many more at `AI_Context/MCP_Bridge_Command_Reference.md`
+### Security & Local Pipe Trust Boundary
 
-### Scanning across more than one window
+Cheat Engine's built-in `createPipe()` creates a Windows Named Pipe without a per-user ACL, meaning other local accounts on a shared Windows machine can connect to the pipe and execute Lua inside Cheat Engine.
 
-Every scan covers up to 200,000 addresses per window and returns
-`next_start_address`. Rather than chaining calls yourself, raise `max_windows`
-(up to 64) on `aob_scan`, `search_string` and `find_references` to walk several
-consecutive regions in a single call — `time_budget_ms` still bounds the whole call.
-Unbounded scans for low-entropy patterns are refused unless you pass
-`allow_unsafe_global=True`.
+On any shared or multi-user machine, set `CE_MCP_AUTH_TOKEN` on **both** Cheat Engine and your MCP client / `check_pipe.py` (`--auth-token` or `$env:CE_MCP_AUTH_TOKEN`). Requests missing a valid token are rejected with JSON-RPC error `-32001` (`Unauthorized`), and `status` reports `auth_required` / `auth_configured` without exposing the secret.
 
-### Safe breakpoint sampling
+---
 
-Before installing a breakpoint, attach to the target and start the debugger in CE
-(for example, run `debugProcess()` directly in CE's Lua console). Finish any attach
-dialog/wait there, then check `status.debugger_started`. This flag means the debugger
-was started; it does not prove that the backend can successfully install a breakpoint.
-The bridge verifies installation separately using CE's actual breakpoint list.
+## Available MCP Tools (48)
 
-Since 11.6.3, execution/data breakpoints and their aliases refuse installation when
-the debugger is not started or its state cannot be queried. CE's
-[`debug_setBreakpoint` implementation](https://github.com/cheat-engine/cheat-engine/blob/master/Cheat%20Engine/LuaHandler.pas)
-implicitly calls `StartDebuggerIfNeeded`; doing this inside the synchronous pipe
-dispatch can stall the request during attachment. Do not start the debugger through
-`evaluate_lua` to work around the check: that uses the same main-thread dispatch.
+| Category | Tools |
+|---|---|
+| **Process & Symbols (6)** | `get_process_info`, `enum_modules`, `get_thread_list`, `get_symbol_address`, `get_address_info`, `get_rtti_classname` |
+| **Memory Read (6)** | `read_memory`, `read_integer`, `read_string`, `read_pointer`, `read_pointer_chain`, `checksum_memory` |
+| **Memory Write (3)** | `write_integer`, `write_memory`, `write_string` |
+| **Scanning & Regions (8)** | `scan_all`, `get_scan_results`, `next_scan`, `aob_scan`, `search_string`, `generate_signature`, `get_memory_regions`, `enum_memory_regions_full` |
+| **Disassembly & Xrefs (7)** | `disassemble`, `get_instruction_info`, `find_function_boundaries`, `analyze_function`, `find_references`, `find_call_references`, `dissect_structure` |
+| **Hardware Breakpoints (6)** | `set_breakpoint`, `set_data_breakpoint`, `remove_breakpoint`, `list_breakpoints`, `clear_all_breakpoints`, `get_breakpoint_hits` |
+| **DBVM Hypervisor (4)** | `get_physical_address`, `start_dbvm_watch`, `poll_dbvm_watch`, `stop_dbvm_watch` |
+| **Scripting & Files (4)** | `evaluate_lua`, `auto_assemble`, `evaluate_lua_file`, `auto_assemble_file` |
+| **Bridge Control (4)** | `ping`, `status`, `cleanup`, `disconnect` |
 
-The Python MCP tools now run blocking pipe I/O in worker threads so a waiting CE
-operation does not block the MCP protocol event loop. The single CE connection is
-still serialized. A concurrent request waits at most `CE_MCP_LOCK_TIMEOUT_MS`
-(default 15000 ms), or the remaining request budget if shorter, for the lock.
-If it expires in the queue, nothing is sent.
-Breakpoint installation uses `CE_MCP_BREAKPOINT_TIMEOUT_MS` (default 10000 ms) as
-its total pipe request budget, with no automatic retry. A timeout cannot cancel CE's
-native debugger operation: inspect CE and the breakpoint state before repeating a
-request. Pending Windows I/O is cancelled and completed before its event and buffer
-are released, so cleanup can finish after the request deadline. The MCP host can
-impose a shorter timeout than the Python pipe client.
+See [AI_Context/MCP_Bridge_Command_Reference.md](AI_Context/MCP_Bridge_Command_Reference.md) for detailed parameter and response schemas.
 
-To apply the fix, restart the Python MCP server and load the updated Lua file in CE.
-A responsive 11.6.2+ worker supports handler hot reload. If CE is already hung,
-the new file cannot repair that running native call; recover/restart CE first.
+---
 
-Hardware breakpoints are not truly "non-breaking": CE briefly stops the triggering
-thread, runs the Lua callback, and resumes it. A persistent breakpoint on a hot API
-such as `WS2_32!send` can therefore starve CE's main thread and make the pipe appear
-disconnected.
+## Operational Notes
 
-`set_breakpoint` and `set_data_breakpoint` now default to `one_shot=True` and
-`max_triggers=256`. They also accept register and memory conditions, evaluated before
-register or stack capture. For example:
+### Multi-Window Scanning & Region Cache
+- `aob_scan`, `search_string`, `find_references`, and `find_call_references` scan 200,000-address windows and accept `max_windows` (up to `64`) bounded by `time_budget_ms`, returning `next_start_address` for seamless continuation (including exact resume cursors when hitting `limit`).
+- Low-entropy unbounded AOB patterns are refused unless `allow_unsafe_global=True` or bounded by `start_address` + `size`.
+- Memory region enumeration is cached for 15 seconds to prevent multi-second stalls on large x64 processes. Pass `refresh=True` to `get_memory_regions` or `enum_memory_regions_full` after target allocations change.
+
+### Safe Bounded Hardware Breakpoints
+- Start the debugger directly in Cheat Engine first (e.g. `debugProcess()` in CE's Lua console) and confirm `status.debugger_started == true`. Breakpoint tools intentionally refuse installation when the debugger is not running to avoid freezing CE's main thread during native attach dialogs.
+- `set_breakpoint` and `set_data_breakpoint` default to `one_shot=True` and `max_triggers=256`, and support ANDed `register` / `memory` conditions (`eq`, `ne`, `lt`, `le`, `gt`, `ge`, `in`, `mask_eq`) evaluated before register or stack capture:
 
 ```json
 {
-  "address": "module+offset",
-  "id": "packet_once",
+  "address": "module+0x1234",
+  "id": "watch_once",
   "one_shot": true,
   "max_triggers": 256,
+  "capture_stack": true,
   "conditions": [
-    {"kind": "register", "register": "R8", "operator": "in", "values": [42, 123, 387]},
+    {"kind": "register", "register": "R8", "operator": "in", "values": [42, 123]},
     {"kind": "memory", "base_register": "RDX", "offset": 0, "size": 1, "operator": "eq", "value": 1}
   ]
 }
 ```
 
-All conditions are ANDed. Supported operators are `eq`, `ne`, `lt`, `le`, `gt`,
-`ge`, `in`, and `mask_eq`. On the first matching hit, or when the trigger cap is
-reached, the bridge removes the breakpoint and preserves its buffered result for
-`get_breakpoint_hits`. Set `one_shot=False` and explicit limits only for known
-low-frequency locations.
+### Local Script Execution
+`evaluate_lua_file` and `auto_assemble_file` read local `.lua` / `.cea` files with automatic encoding detection (UTF-8, UTF-16, GB18030/CP936), bounded streaming reads (`CE_MCP_MAX_LOCAL_FILE_BYTES`), and return `source_file`, `source_encoding`, and `source_length` metadata.
 
-Regression checks (run from `MCP_Server`):
-
-```powershell
-python test_offline.py
-python -m pytest test_server_threading.py test_check_pipe.py -v
-```
-
-These cover Lua preflight/lifecycle behavior, the installed FastMCP tool dispatcher,
-bounded lock waits, non-retried breakpoint requests, and cancellation/recovery on an
-isolated real Windows named pipe. They do not replace live CE debugger validation.
-
----
-
-## Critical Configuration
-
-### BSOD Prevention
+### Cheat Engine Stability & DBVM Caution
 > [!CAUTION]
-> **You MUST disable:** Cheat Engine → Settings → Extra → **"Query memory region routines"**
-> 
-> Enabled: Causes `CLOCK_WATCHDOG_TIMEOUT` BSODs due to conflicts with DBVM/Anti-Cheat when scanning protected pages.
+> Disable **Cheat Engine → Settings → Extra → "Query memory region routines"** when working with protected processes or DBVM to avoid `CLOCK_WATCHDOG_TIMEOUT` BSODs.
 
-### Kernel/DBVM mode
-
-The normal bridge, memory reads, scans, and bounded hardware breakpoints do not require
-the kernel debugger or DBVM. Do not enable them merely to keep the MCP pipe alive:
-they do not remove the per-hit Lua callback cost. Use DBVM only for an explicit
-`start_dbvm_watch` workflow after `status` reports `dbk_loaded` and `dbvm_active`, and
-test it in a disposable session because a driver or hypervisor failure can crash the
-host.
-
----
-
-## Example Workflows
-
-**Finding a value:**
-```
-You: "Scan for gold: 15000"  →  AI finds 47 results
-You: "Gold changed to 15100"  →  AI filters to 3 addresses
-You: "What writes to the first one?"  →  AI sets hardware BP
-You: "Disassemble that function"  →  Full AddGold logic revealed
-```
-
-**Understanding a structure:**
-```
-You: "What's at [[game.exe+0x1234]+0x10]?"
-AI: "RTTI: CPlayerInventory"
-AI: "0x00=vtable, 0x08=itemCount(int), 0x10=itemArray(ptr)..."
-```
+Standard memory reads, scans, and hardware breakpoints do **not** require DBK or DBVM. Enable DBVM only when explicitly using `*_dbvm_watch` tools in a disposable test environment.
 
 ---
 
 ## Project Structure
 
-```
+```text
 MCP_Server/
-├── mcp_cheatengine.py        # Python MCP Server (FastMCP)
-├── ce_mcp_bridge.lua         # Cheat Engine Lua Bridge
-├── check_pipe.py             # Standalone pipe diagnostic (needs only pywin32)
-├── test_offline.py           # Offline Lua tests (stubbed CE, no target process needed)
-├── test_server_threading.py  # Offline MCP server & overlapped pipe tests
-├── test_check_pipe.py        # Offline check_pipe.py & isolated pipe tests
-└── test_mcp.py               # Live test suite (requires CE + attached process)
+├── ce_mcp_bridge.lua           # Cheat Engine Lua bridge (worker thread + hot-reloadable dispatcher)
+├── mcp_cheatengine.py          # FastMCP Python server (overlapped Win32 named-pipe client)
+├── check_pipe.py               # Standalone pipe diagnostic CLI (pywin32 only)
+├── requirements.txt            # Runtime Python dependencies
+├── test_offline.py             # Offline Lua 5.3/5.4 regression suite (245 checks via lupa)
+├── test_server_threading.py    # Offline FastMCP threading, validation & pipe tests (36 tests)
+├── test_check_pipe.py          # Offline check_pipe.py & isolated named-pipe tests (17 tests)
+└── test_mcp.py                 # Live integration suite (requires CE + attached process)
 
 AI_Context/
-├── MCP_Bridge_Command_Reference.md   # MCP Commands reference
-├── CE_LUA_Documentation.md   # Full CheatEngine 7.6 official documentation
-└── AI_Guide_MCP_Server_Implementation.md  # Full technical documentation for AI agent
+├── MCP_Bridge_Command_Reference.md        # Bridge command reference
+├── AI_Guide_MCP_Server_Implementation.md  # Implementation & architecture notes
+└── CE_LUA_Documentation.md                # Links to official Cheat Engine Lua docs
 ```
 
 ---
 
 ## Testing
 
-Two suites, for two different situations.
+### Offline Suites (No Cheat Engine Required)
 
-**Offline** — no Cheat Engine, no target process. Loads `ce_mcp_bridge.lua` into a
-real Lua interpreter with the CE API stubbed and drives the dispatcher against a
-synthetic memory map. Run this after editing the bridge:
-
-```bash
-pip install lupa
-```
-
-```bash
-python MCP_Server/test_offline.py
-```
-
-To run the Python MCP server and `check_pipe.py` offline/isolated-pipe tests using Python's built-in `unittest` (no Cheat Engine, `lupa`, or `pytest` required):
+**Python server & `check_pipe.py` tests** (built-in `unittest`, no extra packages required):
 
 ```bash
 python -m unittest discover -s MCP_Server -p "test_server_threading.py" -v
@@ -433,30 +239,26 @@ Or with `pytest` (`pip install pytest`):
 python -m pytest MCP_Server/test_server_threading.py MCP_Server/test_check_pipe.py -v
 ```
 
-**Live** — requires Cheat Engine running with the bridge loaded and a process attached:
+**Lua bridge offline regression suite** (embeds Lua 5.3/5.4 with stubbed CE APIs):
+
+```bash
+pip install lupa
+python MCP_Server/test_offline.py
+```
+
+### Live Integration Suite (Requires Cheat Engine + Attached Process)
 
 ```bash
 python MCP_Server/test_mcp.py
 ```
 
-It covers:
-- `scan_all` default `dword` behavior
-- direct `read_pointer` semantics
-- structured Lua evaluation
-- Python helper tools such as `evaluate_lua_file` and `auto_assemble_file`
-- regression guards for the bugs fixed in 11.5.0 and 11.6.0 — 64-bit address
-  precision, non-ASCII round trips, the AutoAssembler enable/disable cycle, and
-  bounded conditional breakpoint auto-retirement
-
-Output ends with a per-category breakdown and a total; `generate_signature` is
-skipped by default because `getUniqueAOB` blocks CE while it scans all memory.
-
 ---
 
-## The Bottom Line
+## License & Attribution
 
-You no longer need to be an expert. Just ask the right questions.
+- Licensed under the [MIT License](LICENSE).
+- Original project: [miscusi-peek/cheatengine-mcp-bridge](https://github.com/miscusi-peek/cheatengine-mcp-bridge) (`Copyright (c) 2025 miscusi-peek`).
 
-⚠️ EDUCATIONAL DISCLAIMER
+## Disclaimer
 
-This code is for educational and research purposes only. It's created to show the capabilities of the Model Context Protocol (MCP) and LLM-based debugging. I do not condone the use of these tools for malicious hacking, cheating in multiplayer games, or violating Terms of Service. This is a demonstration of software engineering automation.
+This software is intended strictly for authorized debugging, reverse engineering, security research, and educational software analysis. Do not use it to violate Terms of Service, bypass DRM unlawfully, or cheat in online multiplayer games.
